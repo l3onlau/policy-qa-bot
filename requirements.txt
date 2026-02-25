@@ -1,0 +1,18 @@
+# Orchestration & Logic
+dspy
+langchain 
+langchain-text-splitters
+python-dotenv
+
+# Document Parsing
+docling
+
+# Vector Store & Embeddings
+faiss-cpu
+sentence-transformers
+rank_bm25
+
+# Utilities
+tqdm
+requests
+torch
