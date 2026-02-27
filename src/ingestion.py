@@ -198,6 +198,14 @@ class PolicyIngestor:
             result = self.converter.convert(file_path)
             doc_data = result.document
 
+            # Explicitly unload the Docling backend to free GPU memory
+            if (
+                hasattr(result, "input")
+                and hasattr(result.input, "_backend")
+                and hasattr(result.input._backend, "unload")
+            ):
+                result.input._backend.unload()
+
             # ── Pass 1: Structured item-by-item extraction ────────────────
             heading_path: List[str] = ["General Policy"]
             current_clause = ""

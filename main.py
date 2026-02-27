@@ -5,7 +5,6 @@ Interactive CLI for querying insurance policy documents using a
 retrieval-augmented generation (RAG) pipeline.
 """
 
-from dotenv import load_dotenv
 from src.engine import get_rag_system, setup_dspy
 from src.vectorstore import PolicyVectorStore
 from src.utils import ensure_ingested
@@ -13,7 +12,6 @@ from src.utils import ensure_ingested
 
 def main():
     """Launch the interactive policy Q&A assistant."""
-    load_dotenv()
 
     print("🚀 Initializing Policy Q&A Bot...")
     vectorstore = PolicyVectorStore()

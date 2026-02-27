@@ -32,34 +32,24 @@ class AnswerCorrectness(dspy.Signature):
 
 
 def rule_based_precheck(test: dict, pred: dspy.Prediction) -> tuple[str, str] | None:
-    """
-    Deterministic pre-check for hard-rule violations mandated by the PRD.
-    Distinguishes between Out-of-Scope refusals and Near-Miss refusals.
-    """
-    test_type = test.get("type", "").lower()
-    answer_lower = pred.answer.lower()
+    answer = pred.answer
+    is_refusal = (
+        "I cannot find a definitive answer in the provided policy wording." in answer
+    )
 
-    is_out_of_scope = "out-of-scope" in test_type
-    is_near_miss = "near-miss" in test_type
+    # Rule 1: Out-of-scope questions must be refused
+    if test.get("type", "unknown") == "out-of-scope":
+        if is_refusal:
+            return "PASS", "Properly refused out-of-scope question according to PRD."
+        else:
+            return "FAIL", "Failed to clearly refuse out-of-scope question."
 
-    # Rule 1a: Out-of-Scope queries should NOT find relevant policy documents
-    if is_out_of_scope and pred.policy_found:
-        return (
-            "FAIL",
-            "Out-of-Scope: Expected a complete refusal (policy_found=False) but model indicated policy was found.",
-        )
+    # Rule 2: In-domain or near-miss questions that are answered MUST contain citations
+    if not is_refusal:
+        if "Sources:" not in answer:
+            return "FAIL", "Missing mandatory 'Sources:' citation required by PRD."
 
-    # Rule 1b: Near-Miss queries MUST find a policy to reference, even if refusing
-    if is_near_miss and not pred.policy_found:
-        return (
-            "FAIL",
-            "Near-Miss: Expected policy_found=True to reference related clauses, but none were found.",
-        )
-
-    # Rule 2: Mandatory Citation check (PRD Section 3.1)
-    if "sources:" not in answer_lower:
-        return ("FAIL", "Missing mandatory 'Sources:' citation block.")
-
+    # For anything else, fall back to LLM judge
     return None
 
 

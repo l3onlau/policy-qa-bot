@@ -1,12 +1,15 @@
 import os
-import re
 import pickle
+import re
+from typing import Any, Dict, List, Optional
+
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
-from typing import List, Dict, Any, Optional
 from rank_bm25 import BM25Okapi
-from .utils import get_env_var
+from sentence_transformers import SentenceTransformer
+from transformers import BitsAndBytesConfig
+
+from config import settings
 
 
 def tokenize_text(text: str) -> List[str]:
@@ -31,13 +34,25 @@ class PolicyVectorStore:
     """
 
     def __init__(self):
-        self.model_name = get_env_var("EMBED_MODEL")
-        self.index_path = get_env_var("FAISS_INDEX_PATH", "policy_index.faiss")
+        self.model_name = settings.embed_model
+        self.index_path = settings.faiss_index_path
         self.meta_path = self.index_path.replace(".faiss", "_meta.pkl")
 
         os.makedirs(os.path.dirname(self.index_path), exist_ok=True)
 
-        self.embedder = SentenceTransformer(self.model_name)
+        self.embedder = SentenceTransformer(
+            self.model_name,
+            model_kwargs={
+                "device_map": "auto",
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_enable_fp32_cpu_offload=True,
+                ),
+            },
+        )
+        # Upgrade reasonable context limit
+        if hasattr(self.embedder, "max_seq_length"):
+            self.embedder.max_seq_length = 4096
 
         self.documents: List[str] = []
         self.parent_documents: List[str] = []
@@ -68,14 +83,19 @@ class PolicyVectorStore:
 
         print(f"🧠 Generating embeddings for {len(texts)} child chunks...")
 
-        batch_size = 50
+        # Lower outer batch size for better logging progress tracking
+        batch_size = 10
         all_embeddings = []
         total_batches = (len(texts) + batch_size - 1) // batch_size
 
         for i in range(0, len(texts), batch_size):
             batch_texts = texts[i : i + batch_size]
             print(f"   ⏳ Embedding batch {i // batch_size + 1} of {total_batches}...")
-            batch_emb = self.embedder.encode(batch_texts)
+            # Enforce tiny iteration batch_size (2-4 max) to prevent quadratic
+            # attention memory spikes from 4096 max_length on only 5GB of VRAM
+            batch_emb = self.embedder.encode(
+                batch_texts, batch_size=2, show_progress_bar=False
+            )
             all_embeddings.extend(batch_emb)
 
         embeddings = np.array(all_embeddings).astype("float32")
@@ -131,6 +151,7 @@ class PolicyVectorStore:
         # 1. Vector search (cosine similarity via inner product on normalized vectors)
         query_embedding = self.embedder.encode([query_text]).astype("float32")
         faiss.normalize_L2(query_embedding)
+
         search_k = n_results * 8 if filters else n_results * 4
         faiss_distances, faiss_indices = self.index.search(query_embedding, search_k)
         faiss_results = [i for i in faiss_indices[0] if i != -1]
@@ -197,9 +218,11 @@ class PolicyVectorStore:
 
         return {
             "documents": [
-                self.parent_documents[i]
-                if i < len(self.parent_documents)
-                else self.documents[i]
+                (
+                    self.parent_documents[i]
+                    if i < len(self.parent_documents)
+                    else self.documents[i]
+                )
                 for i in deduped_indices
             ],
             "metadatas": [self.metadatas[i] for i in deduped_indices],

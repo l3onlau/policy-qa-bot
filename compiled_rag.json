@@ -1,0 +1,65 @@
+{
+  "predict": {
+    "traces": [],
+    "train": [],
+    "demos": [
+      {
+        "augmented": true,
+        "context": "VERIFIED DOCUMENT SEGMENT:\nAll Class-4 starships must disengage hyperdrive within 50,000 km of a major space station to prevent gravimetric shearing. Violations incur a 500-credit fine.\nCitation To Use: Fleet Ops Manual §4.1 (Navigation), p.12\n[REMINDER: Use ONLY this segment text for your answer. DO NOT hallucinate rules.]\n",
+        "question": "What is the fine for engaging hyperdrive near a space station?",
+        "reasoning": "The context specifies that Class-4 starships must disengage hyperdrive within 50,000 km of a major space station to avoid gravimetric shearing. It also states that violations incur a 50-credit fine. The question asks about the fine for engaging hyperdrive near a space station, which is directly addressed in the rule. Since engaging hyperdrive within that range is a violation, the fine applies.",
+        "reasoning_and_answer": "The fine for engaging hyperdrive within 50,000 km of a major space station is 500 credits. This is because the rule states that all Class-4 starships must disengage hyperdrive within that range to prevent gravimetric shearing, and any violation incurs a 500-credit fine.",
+        "sources": "Fleet Ops Manual §4.1 (Navigation), p.12"
+      },
+      {
+        "augmented": true,
+        "context": "VERIFIED DOCUMENT SEGMENT:\nCrew members of alien descent (Non-Terran) are granted an additional 4 cycles of solar rest per standard orbit, provided they submit form X-99 to the bio-medical bay.\nCitation To Use: HR Directives §8.2 (Leave), p.44\n[REMINDER: Use ONLY this segment text for your answer. DO NOT hallucinate rules.]\n",
+        "question": "Do aliens get extra vacation time?",
+        "reasoning": "The context states that crew members of alien descent (Non-Terran) are granted an additional 4 cycles of solar rest per standard orbit, which is equivalent to extra rest time. The term \"solar rest\" is interpreted as vacation or rest time. Therefore, aliens are granted extra rest time under the specified conditions.",
+        "reasoning_and_answer": "Yes, aliens are granted extra vacation time—specifically, an additional 4 cycles of solar rest per standard orbit—provided they submit form X-99 to the bio-medical bay.",
+        "sources": "HR Directives §8.2 (Leave), p.44"
+      },
+      {
+        "augmented": true,
+        "context": "VERIFIED DOCUMENT SEGMENT:\nThe primary plasma weapon may only be fired if: 1) Shields are below 20%, 2) The captain issues a Code Red, and 3) The target is a confirmed hostile dreadnought.\nCitation To Use: Combat Protocol §9.9 (Weapons), p.88\n[REMINDER: Use ONLY this segment text for your answer. DO NOT hallucinate rules.]\n",
+        "question": "Can I fire the plasma weapon at a small fighter?",
+        "reasoning": "The context specifies that the primary plasma weapon may only be fired under three conditions: shields below 20%, a captain-issued Code Red, and the target being a confirmed hostile dreadnought. A small fighter does not meet the condition of being a \"confirmed hostile dreadnought,\" so the weapon cannot be fired at a small fighter based on the provided rules.",
+        "reasoning_and_answer": "No, the plasma weapon cannot be fired at a small fighter because the target must be a confirmed hostile dreadnought, as specified in the combat protocol. A small fighter does not qualify as a hostile dreadnought.",
+        "sources": "Combat Protocol §9.9 (Weapons), p.88"
+      }
+    ],
+    "signature": {
+      "instructions": "You are a strict insurance compliance assistant. Answer questions using ONLY the provided context.\n\nCITATION VERIFICATION: Always end your answer by accurately populating the `sources` field exactly with the pre-formatted citations explicitly provided alongside the relevant facts in the context text.",
+      "fields": [
+        {
+          "prefix": "Context:",
+          "description": "Relevant policy document chunks with pre-formatted citations."
+        },
+        {
+          "prefix": "Question:",
+          "description": "The user's specific insurance inquiry."
+        },
+        {
+          "prefix": "Reasoning: Let's think step by step in order to",
+          "description": "${reasoning}"
+        },
+        {
+          "prefix": "Reasoning And Answer:",
+          "description": "The rigorous, grounded factual answer based exclusively on the context."
+        },
+        {
+          "prefix": "Sources:",
+          "description": "The pre-formatted citations provided in the context."
+        }
+      ]
+    },
+    "lm": null
+  },
+  "metadata": {
+    "dependency_versions": {
+      "python": "3.12",
+      "dspy": "3.1.3",
+      "cloudpickle": "3.1"
+    }
+  }
+}

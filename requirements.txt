@@ -2,7 +2,7 @@
 dspy
 langchain 
 langchain-text-splitters
-python-dotenv
+pydantic-settings
 
 # Document Parsing
 docling
@@ -16,3 +16,4 @@ rank_bm25
 tqdm
 requests
 torch
+bitsandbytes

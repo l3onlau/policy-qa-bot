@@ -4,39 +4,21 @@ A Retrieval-Augmented Generation (RAG) assistant for insurance policy documents.
 
 ## Features
 
-- **Two-Pass Ingestion Strategy:** Uses [Docling](https://github.com/DS4SD/docling) for high-fidelity structured extraction (tables, lists, OCR), followed by a page-level reconciliation pass to guarantee zero missing content due to layout edge cases.
-- **Parent-Document Retrieval:** Indexes small child chunks for precise search but returns larger parent chunks for richer LLM context.
-- **Dual-BM25 Hybrid Retrieval:** Combines FAISS vector search with separate BM25 keyword matching for both child and parent chunks via Reciprocal Rank Fusion (RRF), ensuring broad contextual terms and specific keywords are reliably surfaced.
-- **Agentic 3-Chain RAG Pipeline:** Uses [DSPy](https://github.com/stanfordnlp/dspy) for query reformulation, reranking relevance gating, and a unified generation-classification step that natively enforces grounded answers and structural constraints.
-- **2-Layer Hybrid Evaluation:** Rule-based pre-checks target definitive edge cases (Near-Miss, Out-of-Scope), followed by an LLM-judge fallback. This guarantees rigorous adherence to product requirements while eliminating standard LLM judge non-determinism.
+- **Robust Ingestion:** Uses Docling for high-fidelity extraction of complex structural PDFs natively.
+- **Concurrent Retrieval:** Async fetching via FAISS vector search and Dual-BM25 keyword matching (parent & child chunks explicitly merged via RRF).
+- **Post-Retrieval Distillation:** Distills large 800-token chunks into smaller factual sentences for precise generation.
+- **DSPy Few-Shot Generation:** Enforces rigid factual citations using a prompt structurally compiled on synthetic offline data.
 
 ---
-
-## Architecture
-
-```
-User Question
-    │
-    ▼
-[Chain 1: LLM Query Reformulator] ──► 2-3 domain-adapted search queries
-    │
-    ▼
-[FAISS + Dual BM25 Multi-Query Retrieval] ──► Merged + deduplicated candidates
-    │
-    ▼
-[Chain 2: Cross-Encoder Reranker + Gate] ──► Filtered top-k chunks with a hard relevance backstop
-    │
-    ▼
-[Chain 3: Grounded Answer Generation] ──► DSPy CoT derives the answer and simultaneous classification
-```
 
 ### Models
 
 | Component | Model | Runtime |
 |---|---|---|
-| LLM | `gemma3:4b-it-q4_K_M` | Ollama |
-| Embeddings | `paraphrase-multilingual-MiniLM-L12-v2` | HuggingFace (Sentence Transformers) |
-| Reranker | `cross-encoder/ms-marco-MiniLM-L-6-v2` | HuggingFace |
+| LLM | `qwen3:4b-instruct-2507-q4_K_M` | Ollama |
+| Embeddings | `Qwen/Qwen3-Embedding-0.6B` | HuggingFace (8-bit Quantized) |
+| Reranker | `tomaarsen/Qwen3-Reranker-0.6B-seq-cls` | HuggingFace (8-bit Quantized) |
+| NLI Judge | `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` | HuggingFace (8-bit Quantized) |
 
 ---
 
@@ -74,7 +56,7 @@ pip install -r requirements.txt
 ### Pull Models
 
 ```bash
-ollama pull gemma3:4b-it-q4_K_M
+ollama pull qwen3:4b-instruct-2507-q4_K_M
 ```
 
 ### Data Preparation
@@ -108,20 +90,29 @@ Runs 10 test cases from `tests.json` and writes results to `eval_report.json`. T
 
 ## Configuration
 
-All models and paths are configured via `.env`:
+All models and paths are configured via `config.py`:
 
-```env
-DSPY_LM_MODEL=ollama_chat/gemma3:4b-it-q4_K_M
+```config
+DSPY_LM_MODEL=ollama_chat/qwen3:4b-instruct-2507-q4_K_M
 DSPY_API_BASE=http://localhost:11434
-EMBED_MODEL=sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
-RERANKER_MODEL=cross-encoder/ms-marco-MiniLM-L-6-v2
+EMBED_MODEL=Qwen/Qwen3-Embedding-0.6B
+RERANKER_MODEL=tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+NLI_MODEL=MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
 FAISS_INDEX_PATH=./faiss_db/policy_index.faiss
 DATA_DIR=./data
 TOP_K_RERANK=10
 RELEVANCE_THRESHOLD=-5.0
+
+# AI Engineering Flags
+USE_SEMANTIC_CACHE=True
+USE_INTENT_ROUTING=True
+USE_QUERY_REFORMULATION=True
+USE_CHUNK_DISTILLATION=True
+USE_NLI_ENTAILMENT_CHECK=True
+MAX_RETRIES=1
 ```
 
-To swap models, update the `.env` values — no code changes required.
+To swap models, update the `config.py` values — no code changes required.
 
 ---
 
@@ -136,7 +127,7 @@ To swap models, update the `.env` values — no code changes required.
 ├── design_notes.md      # Architecture and design decisions
 ├── src/
 │   ├── __init__.py      # Package marker
-│   ├── engine.py        # 3-chain agentic RAG pipeline (reformulate → retrieve & gate → generate)
+│   ├── engine.py        # 4-chain agentic RAG pipeline (reformulate → retrieve & gate → generate → verify)
 │   ├── ingestion.py     # 2-pass PDF parsing and parent-child chunking
 │   ├── vectorstore.py   # FAISS + Dual BM25 hybrid store with RRF
 │   └── utils.py         # Shared utilities (citations, env vars)
@@ -150,8 +141,8 @@ To swap models, update the `.env` values — no code changes required.
 
 This architecture is strictly optimized for local consumer hardware (e.g., 6GB VRAM GPUs), introducing necessary performance trade-offs.
 
-* **Evaluation Limitations (4B Models):** To fit within memory limits, the system relies on a heavily quantized small-parameter model (`gemma3:4b-it-q4_K_M`). This model is underpowered for complex reasoning and suffers from massive "same-model bias" when acting as an LLM judge for its own outputs. As a result, the `test_bot.py` evaluation suite typically scores around 5 ± 2, with an expected variance of ± 2 false positives/negatives.
+* **Evaluation Limitations (4B Models):** To fit within memory limits, the system relies on a heavily quantized small-parameter model (`qwen3:4b-instruct-2507-q4_K_M`). This model is underpowered for complex reasoning and suffers from massive "same-model bias" when acting as an LLM judge for its own outputs. As a result, the `test_bot.py` evaluation suite typically scores around 5 ± 2, with an expected variance of ± 2 false positives/negatives.
 * **Reranker as a "Hard Gate":** Small models struggle to execute clean refusals and often try to force out-of-scope concepts into their answers. The Cross-Encoder reranker functions as a mandatory mathematical gate to counteract this. By calculating exact relevance probabilities and aggressively dropping chunks, it physically starves the LLM of irrelevant context to force deterministic "Out-of-Scope" refusals.
 
 > [!WARNING]
-> **Automatic Memory Management:** To ensure stable 100% GPU inference and prevent Out-of-Memory (OOM) crashes on limited hardware, the codebase automatically manages memory by clearing Ollama's VRAM and flushing the CUDA cache between heavy workloads (e.g., transitioning between document ingestion and evaluation).
+> **Automatic Memory Management:** To ensure stable execution even on constrained hardware (e.g. 5GB VRAM limits), the system strictly utilizes 8-bit dynamic quantization + CPU offloading for the majority of the Transformer pipelines where supported. Furthermore, heavy processing contexts (4096 tokens) are batched down to micro-batches (batch_size=1) to prevent quadratic attention OOM spikes natively during inference.
