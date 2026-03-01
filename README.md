@@ -15,10 +15,9 @@ A Retrieval-Augmented Generation (RAG) assistant for insurance policy documents.
 
 | Component | Model | Runtime |
 |---|---|---|
-| LLM | `qwen3:4b-instruct-2507-q4_K_M` | Ollama |
+| LLM / Judge | `qwen3:4b-instruct-2507-q4_K_M` | Ollama |
 | Embeddings | `Qwen/Qwen3-Embedding-0.6B` | HuggingFace (8-bit Quantized) |
 | Reranker | `tomaarsen/Qwen3-Reranker-0.6B-seq-cls` | HuggingFace (8-bit Quantized) |
-| NLI Judge | `MoritzLaurer/mDeBERTa-v3-base-mnli-xnli` | HuggingFace (8-bit Quantized) |
 
 ---
 
@@ -97,18 +96,16 @@ DSPY_LM_MODEL=ollama_chat/qwen3:4b-instruct-2507-q4_K_M
 DSPY_API_BASE=http://localhost:11434
 EMBED_MODEL=Qwen/Qwen3-Embedding-0.6B
 RERANKER_MODEL=tomaarsen/Qwen3-Reranker-0.6B-seq-cls
-NLI_MODEL=MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
 FAISS_INDEX_PATH=./faiss_db/policy_index.faiss
 DATA_DIR=./data
 TOP_K_RERANK=10
-RELEVANCE_THRESHOLD=-5.0
 
 # AI Engineering Flags
 USE_SEMANTIC_CACHE=True
 USE_INTENT_ROUTING=True
 USE_QUERY_REFORMULATION=True
 USE_CHUNK_DISTILLATION=True
-USE_NLI_ENTAILMENT_CHECK=True
+USE_ENTAILMENT_CHECK=True
 MAX_RETRIES=1
 ```
 

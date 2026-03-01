@@ -35,5 +35,5 @@ Insurance policies are structured around exclusions. The system handles scenario
 |---|---|
 | **Out-of-Scope (Conversational)** | An `_is_valid_query` regex intercepts and refuses queries like "hello" instantly, bypassing LLM compute entirely. |
 | **Explicit exclusion found** | Cross-encoder scores high (exclusion is relevant to the question) → LLM outputs definitively and writes a "No" answer citing the exclusion. |
-| **No relevant information whatsoever** | Cross-encoder scores very low (< -5.0) → Hard backstop rejects context entirely → System short-circuits to the PRD refusal string: *"I cannot find a definitive answer in the provided policy wording."* |
-| **Ambiguous / Hallucinated Connections** | A Natural Language Inference (NLI) model explicitly evaluates the LLM's generated facts against the raw chunk. If entailment is low or contradicted, generation is blocked and defaults to the refusal string. |
+| **No relevant information whatsoever** | Cross-encoder scores very low (< 0.3) and no documentes retrieve → Hard backstop rejects context entirely → System short-circuits to the PRD refusal string: *"I cannot find a definitive answer in the provided policy wording."* |
+| **Ambiguous / Hallucinated Connections** | An LLM-as-a-judge (utilizing DSPy Chain-of-Thought) explicitly reasons step-by-step to evaluate if the generated response entail the retrieved context. If faithfull is judged too low, generation is blocked and defaults to the refusal string. |

@@ -8,26 +8,28 @@ from dotenv import load_dotenv
 
 class AnswerCorrectness(dspy.Signature):
     """
-    You are a strict, objective grader evaluating an AI's answer against a required behavior.
+    You are a strict, objective grader evaluating whether an AI's 'generated_answer' matches the factual meaning and conclusion of the 'expected_answer'.
 
-    CRITICAL GRADING RULES:
-    1. FACT CHECK: Read the 'expected_behavior'. If it requires a specific number, name, or fact, verify that exact detail exists in the 'generated_answer'. If it is missing, you MUST output FAIL.
-    2. CONTRADICTION: If the 'generated_answer' says the opposite of the 'expected_behavior' (e.g., saying something is covered when it should be excluded), output FAIL.
-    3. PASS CONDITION: Only output PASS if the generated answer clearly and correctly fulfills the exact instructions in the 'expected_behavior'.
-    4. CONSISTENCY: Your 'verdict' MUST be consistent with your 'reason'. If your reason explains the answer is correct, you MUST output PASS. Never contradict yourself.
-    5. LENIENT ON FORMAT: Focus on whether the SUBSTANCE of the answer is correct, not how it is phrased.
+    CRITICAL RULES (STRICTLY ENFORCED BY YOU):
+    1. CONTRADICTION = FAIL: If the 'expected_answer' explicitly defines something, provides a rule, or claims coverage, and the 'generated_answer' claims it is not defined, not covered, or unknown, you MUST output FAIL.
+    2. YES/NO MISMATCH = FAIL: If the 'expected_answer' starts with or says 'Yes' or 'Covered', but the 'generated_answer' says 'No' or 'Excluded' (or vice versa), output FAIL.
+    3. FABRICATION = FAIL: If the 'generated_answer' confidently states coverage, exclusions, or rules that directly conflict with the core facts in 'expected_answer', output FAIL.
+    4. NO DEFINITIVE ANSWER MISMATCH = FAIL: If the 'expected_answer' states 'I cannot find a definitive answer', but the 'generated_answer' gives a definitive 'Yes' or 'No', output FAIL.
+    5. PASS CONDITION: Output PASS ONLY IF the 'generated_answer' fundamentally agrees with the core facts and main conclusion of the 'expected_answer' without any contradiction.
     """
 
     question = dspy.InputField()
-    expected_behavior = dspy.InputField(
-        desc="The exact logical behavior or facts the answer MUST contain."
+    expected_answer = dspy.InputField(
+        desc="The absolute factual truth. The generated answer MUST match its core logic, facts, and conclusions."
     )
-    generated_answer = dspy.InputField()
+    generated_answer = dspy.InputField(
+        desc="The AI's answer to evaluate."
+    )
     verdict = dspy.OutputField(
-        desc="Output EXACTLY 'PASS' or 'FAIL'. Must be consistent with your reason."
+        desc="Output EXACTLY 'PASS' if the generated answer fully agrees with the expected answer. Output 'FAIL' if there is ANY contradiction, missing main definition, or yes/no mismatch."
     )
     reason = dspy.OutputField(
-        desc="A 1-sentence explanation of why it passed or failed."
+        desc="One clear, concise sentence explaining why the answer PASSED or FAILED based strictly on comparing the facts in generated vs expected answers."
     )
 
 
@@ -89,7 +91,7 @@ def run_evals():
             try:
                 eval_result = llm_judge(
                     question=test["question"],
-                    expected_behavior=test["expected_behavior"],
+                    expected_answer=test["expected_answer"],
                     generated_answer=pred.answer,
                 )
                 verdict = "PASS" if "PASS" in eval_result.verdict.upper() else "FAIL"

@@ -7,6 +7,8 @@ from docling.datamodel.pipeline_options import PdfPipelineOptions
 from docling.document_converter import DocumentConverter, PdfFormatOption
 from docling_core.types.doc import DocItemLabel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
+from transformers import AutoTokenizer
+from config import settings
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -52,21 +54,27 @@ class PolicyIngestor:
             }
         )
 
+        self.tokenizer = AutoTokenizer.from_pretrained(settings.hf_tokenizer)
+
         # Parent chunks: ~750 tokens — what the LLM sees (PRD: 400-800 tokens)
         self.parent_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=3000,
-            chunk_overlap=300,
-            length_function=len,
+            chunk_size=800,
+            chunk_overlap=80,
+            length_function=self._token_length,
             separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " "],
         )
 
         # Child chunks: ~200 tokens — what FAISS indexes for precise search
         self.child_splitter = RecursiveCharacterTextSplitter(
-            chunk_size=800,
-            chunk_overlap=100,
-            length_function=len,
+            chunk_size=200,
+            chunk_overlap=20,
+            length_function=self._token_length,
             separators=["\n\n", "\n", ". ", " "],
         )
+
+    def _token_length(self, text: str) -> int:
+        """Calculate the number of tokens in a string using the HF tokenizer."""
+        return len(self.tokenizer.encode(text))
 
     def extract_clause(self, text: str) -> str:
         """Extract a clause number from a heading (e.g., '1.', '3.2', 'Section 4')."""
@@ -99,11 +107,14 @@ class PolicyIngestor:
         path_str = " > ".join(heading_path)
         display_path = f"{path_str} ({label_suffix})" if label_suffix else path_str
 
+        is_table = label_suffix == "Table"
+        
         parent_chunks = self.parent_splitter.split_text(full_text)
 
         for parent_text in parent_chunks:
             parent_id = str(uuid.uuid4())
             parent_with_heading = f"## {display_path}\n\n{parent_text}"
+            
             child_chunks = self.child_splitter.split_text(parent_text)
 
             for child_text in child_chunks:
@@ -119,6 +130,7 @@ class PolicyIngestor:
                             "page": page,
                             "heading_path": path_str,
                             "parent_id": parent_id,
+                            "is_table": is_table,
                         },
                     }
                 )

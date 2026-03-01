@@ -7,7 +7,6 @@ import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
-from transformers import BitsAndBytesConfig
 
 from config import settings
 
@@ -42,13 +41,14 @@ class PolicyVectorStore:
 
         self.embedder = SentenceTransformer(
             self.model_name,
-            model_kwargs={
-                "device_map": "auto",
-                "quantization_config": BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    llm_int8_enable_fp32_cpu_offload=True,
-                ),
-            },
+            device="cpu",
+            # model_kwargs={
+            #     "device_map": "auto",
+            #     "quantization_config": BitsAndBytesConfig(
+            #         load_in_8bit=True,
+            #         llm_int8_enable_fp32_cpu_offload=True,
+            #     ),
+            # },
         )
         # Upgrade reasonable context limit
         if hasattr(self.embedder, "max_seq_length"):

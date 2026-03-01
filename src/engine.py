@@ -1,6 +1,6 @@
 import dspy
 from sentence_transformers import CrossEncoder
-from transformers import BitsAndBytesConfig, pipeline
+from transformers import BitsAndBytesConfig
 import logging
 import json
 import re
@@ -34,16 +34,25 @@ def get_logger():
 logger = get_logger()
 
 
-class FactDecomposition(dspy.Signature):
+class FaithfulnessJudge(dspy.Signature):
     """
-    Decompose a complex text into a list of atomic facts.
-    Each fact should be a simple, standalone proposition that can be independently verified.
+    You are an independent, highly critical insurance compliance auditor checking another agent's work.
+    Your task is to verify if the claim is STRICTLY supported by the context.
+    To mitigate self-evaluation bias, assume the claim is incorrect until proven otherwise.
+    
+    RULES:
+    1. Read the context carefully.
+    2. Read the claim.
+    3. Check if every part of the claim is directly supported by the context (synonyms like 'we will pay' for 'covered' are allowed).
+    4. If ANY part of the claim brings in outside information, introduces unsupported conditions, or contradicts the context, return 0.0.
+    5. If the claim is fully supported by the text, return 1.0.
     """
 
-    text = dspy.InputField(desc="The text to decompose")
-    facts = dspy.OutputField(
-        desc="A newline-separated list of atomic facts", format=str
-    )
+    context = dspy.InputField(desc="The official policy wording.")
+    claim = dspy.InputField(desc="Claim made by the assistant.")
+
+    # By using CoT, we force the model to reason through the synonyms first
+    is_faithful: bool = dspy.OutputField(desc="Output True if strictly supported, False otherwise.")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -83,18 +92,21 @@ class PolicySignature(dspy.Signature):
     """
     You are a strict insurance compliance assistant. Answer questions using ONLY the provided context.
 
-    CITATION VERIFICATION: Always end your answer by accurately populating the `sources` field exactly with the pre-formatted citations explicitly provided alongside the relevant facts in the context text.
+    CITATION VERIFICATION: Accurately populate the `sources` field with the pre-formatted citations.
     """
 
     context = dspy.InputField(
         desc="Relevant policy document chunks with pre-formatted citations."
     )
     question = dspy.InputField(desc="The user's specific insurance inquiry.")
+    can_answer: bool = dspy.OutputField(
+        desc="True if the context provides a definitive answer (or states it is explicitly covered/excluded). False if the context is a poor match, conflicts, or doesn't explicitly cover the specifics."
+    )
     reasoning_and_answer = dspy.OutputField(
-        desc="The rigorous, grounded factual answer based exclusively on the context."
+        desc="If can_answer is True, provide a rigorous factual answer based exclusively on the context. If False, explain briefly why the context doesn't contain the answer and list closest related clauses."
     )
     sources = dspy.OutputField(
-        desc="The pre-formatted citations provided in the context."
+        desc="The pre-formatted citations provided in the context, or 'None'."
     )
 
 
@@ -116,7 +128,6 @@ class PolicyRAG(dspy.Module):
         self.vectorstore = vectorstore
         self.reformulator = dspy.Predict(QueryReformulator)
         self.generator = dspy.ChainOfThought(PolicySignature)
-        self.fact_extractor = dspy.Predict(FactDecomposition)
 
         self.reranker = CrossEncoder(
             settings.reranker_model,
@@ -129,24 +140,10 @@ class PolicyRAG(dspy.Module):
             max_length=4096,
         )
 
-        self.nli_judge = None
-        if settings.use_nli_entailment_check:
-            nli_model_name = settings.nli_model
-            print(f"Loading NLI Judge: {nli_model_name}")
-            self.nli_judge = pipeline(
-                "text-classification",
-                model=nli_model_name,
-                device_map="auto",
-                model_kwargs={
-                    "quantization_config": BitsAndBytesConfig(
-                        load_in_8bit=True,
-                        llm_int8_enable_fp32_cpu_offload=True,
-                    )
-                },
-            )
+        self.faithfulness_judge = dspy.ChainOfThought(FaithfulnessJudge)
 
         self.top_k = settings.top_k_rerank
-        self.relevance_threshold = settings.relevance_threshold
+        self.relevance_threshold = 0.3
 
         # Simple exact-match semantic cache
         self._cache = {}
@@ -271,16 +268,10 @@ class PolicyRAG(dspy.Module):
                 f"Chain 2 | Reranked #{i + 1} score={cs:.3f}, doc={cm.get('doc_name')}"
             )
 
-        # Apply relevance gating explicitly
-        combined = [x for x in combined if x[2] >= self.relevance_threshold]
-
-        if not combined:
-            return dspy.Prediction(
-                answer=f"{REFUSAL_STRING}\nExplanation: The query is completely out-of-scope. No relevant policy clauses matched your question.",
-                policy_found=False,
-                answer_type=ANSWER_TYPE_REFUSAL,
-                retrieved_chunks=[],
-            )
+        # Instead of applying relevance gating explicitly here on the aggregate chunk score,
+        # we filter out low-relevance sentences during chunk distillation.
+        # This prevents us from dropping chunks that contain a highly relevant sentence
+        # but have a low overall aggregate score.
 
         # ── Chain 2.5: Post-Retrieval Chunk Distillation ──────────────────
         # Split large chunks into sentences, score them, and take only the most relevant
@@ -289,6 +280,12 @@ class PolicyRAG(dspy.Module):
 
         if settings.use_chunk_distillation:
             for doc_text, meta, _ in combined[: self.top_k]:
+                if meta.get("is_table"):
+                    # Bypass sentence splitting for tables, keep intact
+                    distilled_pairs.append([question, doc_text])
+                    sentence_metadata.append({"text": doc_text, "meta": meta})
+                    continue
+
                 # Simple sentence tokenizer (split by . ! ? followed by space or newline)
                 sentences = [
                     s.strip()
@@ -341,8 +338,20 @@ class PolicyRAG(dspy.Module):
                 break
 
         if not final_distilled:
-            # Fallback to the original chunks if distillation strips too much
-            final_distilled = combined[: self.top_k]
+            if not settings.use_chunk_distillation:
+                final_distilled = [
+                    x
+                    for x in combined[: self.top_k]
+                    if x[2] >= self.relevance_threshold
+                ]
+
+            if not final_distilled:
+                return dspy.Prediction(
+                    answer=f"{REFUSAL_STRING}\nExplanation: The query's specifics could not be confidently verified against the policy document. (Reason: No relevant clauses matched your question.)\n\nSources: None",
+                    policy_found=False,
+                    answer_type=ANSWER_TYPE_REFUSAL,
+                    retrieved_chunks=[],
+                )
 
         # ── Chain 3: Generation & Classification (With Fallback Routing) ──
         context_blocks = []
@@ -359,16 +368,21 @@ class PolicyRAG(dspy.Module):
 
         full_context = "\n---\n".join(context_blocks)
 
-        max_retries = settings.max_retries if settings.use_nli_entailment_check else 0
-        nli_label = ""
+        max_retries = (
+            settings.max_retries if settings.use_faithfulness_judge_check else 0
+        )
+        refusal_label = ""
         is_refusal = False
         max_score = combined[0][2] if combined else -999.0
         policy_found = bool(combined)
 
+        logger.debug(
+            f"Chain 3 | Generator Input:\ncontext: {full_context}\nquestion: {question}"
+        )
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 print(
-                    f"⚠️ NLI Check Failed (Faithfulness too low). Retrying generation (Attempt {attempt})..."
+                    f"⚠️ LLM Check Failed (Faithfulness too low). Retrying generation (Attempt {attempt})..."
                 )
                 # Fallback Routing: prompt with explicit feedback
                 retry_question = f"{question}\n\nWARNING: Your previous answer contained unverified facts. You MUST stick strictly to the context."
@@ -380,131 +394,92 @@ class PolicyRAG(dspy.Module):
             raw_answer = pred.reasoning_and_answer
             logger.debug(f"Chain 3 | Generator Output:\n{raw_answer}")
 
-            # Fast-path: if the LLM correctly refuses based on poor context, bypass NLI
-            if REFUSAL_STRING.lower() in raw_answer.lower():
+            # Fast-path: check boolean flag for refusal
+            can_answer = getattr(pred, 'can_answer', True)
+            if isinstance(can_answer, str):
+                can_answer = can_answer.strip().lower() == "true"
+                
+            if not can_answer or REFUSAL_STRING.lower() in raw_answer.lower():
                 is_refusal = True
-                nli_label = "Model Refusal"
+                refusal_label = "Model Refusal"
                 break
 
-            # ── Chain 4: NLI Entailment Verification ──────────────────────────
-            # NLI verifies that the LLM's generated factual answer is fully entailed
-            # by the retrieved context chunks (no hallucinated details).
-            if settings.use_nli_entailment_check:
+            # ── Chain 4: LLM as a judge Verification ──────────────────────────
+            if settings.use_faithfulness_judge_check:
                 try:
-                    # 1. Decompose answer into atomic facts
-                    facts_str = self.fact_extractor(text=raw_answer).facts
-                    atomic_facts = [
-                        f.strip("- *") for f in facts_str.split("\n") if f.strip("- *")
-                    ]
-                    logger.debug(
-                        f"Chain 4 | Facts extracted: {json.dumps(atomic_facts)}"
+                    pred_judge = self.faithfulness_judge(
+                        context=full_context, claim=raw_answer
                     )
 
-                    fact_scores = []
+                    # Simple boolean check from the 4B model
+                    is_faithful_verdict = getattr(pred_judge, 'is_faithful', False)
+                    
+                    # Ensure it's a bool (in case dspy/model returns a truthy string)
+                    if isinstance(is_faithful_verdict, str):
+                        is_faithful_verdict = is_faithful_verdict.strip().lower() == "true"
 
-                    # Build local context chunks used by the generator
-                    # We evaluate against the full provided context so the NLI doesn't
-                    # break when a fact is synthesized from multiple consecutive sentences
-                    chunks = [full_context]
+                    logger.debug(f"Chain 4 | Judge Verdict (is_faithful): {is_faithful_verdict}")
 
-                    # 2. Score each fact
-                    for fact in atomic_facts:
-                        best_fact_score = 0.0
-
-                        # IGNORING HUGGINGFACE WARNING:
-                        # "You seem to be using the pipelines sequentially on GPU..."
-                        # We intentionally use a raw sequential loop instead of a HuggingFace
-                        # Dataset object. Passing a Dataset batch would cause 4096-token attention
-                        # matrices to calculate simultaneously, instantly OOM crashing the 5GB VRAM limit.
-                        # Squeezing it individually is a required constraint.
-                        for chunk in chunks:
-                            nli_input = {"text": chunk, "text_pair": fact}
-
-                            # Use top_k=None to get scores for all labels
-                            nli_result = self.nli_judge(
-                                nli_input, truncation=True, max_length=512, top_k=None
-                            )
-
-                            # Handle pipeline output list format
-                            if isinstance(nli_result, list) and isinstance(
-                                nli_result[0], list
-                            ):
-                                scores = nli_result[0]
-                            elif isinstance(nli_result, list):
-                                scores = nli_result
-                            else:
-                                scores = [nli_result]
-
-                            entailment_prob = 0.0
-                            for s in scores:
-                                # Extract entailment score (handles mDeBERTa 'entailment' and MiniCheck '1')
-                                lbl = str(s.get("label", "")).strip().lower()
-                                if lbl == "entailment" or lbl == "1":
-                                    entailment_prob = float(s.get("score", 0.0))
-                                    break
-                                elif lbl == "contradiction" or lbl == "0":
-                                    # Fallback if entailment not explicitly output but contradiction is highly scored
-                                    entailment_prob_fallback = max(
-                                        0.0, 1.0 - float(s.get("score", 0.0))
-                                    )
-                                    if entailment_prob == 0.0:
-                                        entailment_prob = entailment_prob_fallback
-
-                            if entailment_prob > best_fact_score:
-                                best_fact_score = entailment_prob
-
-                        fact_scores.append(best_fact_score)
-
-                    # 3. Aggregate faithfulness & hallucination metrics
-                    if fact_scores:
-                        avg_faithfulness = sum(fact_scores) / len(fact_scores)
-                        worst_hallucination = min(fact_scores)
-                    else:
-                        avg_faithfulness = 1.0
-                        worst_hallucination = 1.0
-
-                    logger.debug(
-                        f"Chain 4 | Mean Faithfulness={avg_faithfulness:.3f}, Worst Fact={worst_hallucination:.3f}"
-                    )
-                    nli_label = f"Faithfulness: {avg_faithfulness:.2f}, Worst Fact: {worst_hallucination:.2f}"
-
-                    # 4. Refuse based on user-defined thresholds
-                    if avg_faithfulness >= 0.8 and worst_hallucination >= 0.5:
+                    if is_faithful_verdict:
+                        # Success (Faithful)
                         is_refusal = False
-                        break  # Pass NLI, exit retry loop
+                        break  # Pass Faithfulness, exit retry loop
                     else:
+                        # Failure
+                        logger.debug(
+                            f"Chain 4 | Rejected by Judge: claim not strictly supported."
+                        )
                         is_refusal = True  # Fail, will retry if attempts left
 
                 except Exception as e:
-                    # Fallback to refusal if hallucination detection breaks
-                    is_refusal = True
-                    nli_label = f"NLI Error: {str(e)}"
-                    logger.error(f"Chain 4 | NLI Error: {str(e)}")
+                    logger.error(f"Chain 4 | Error inside FaithfulnessJudge: {e}")
                     break  # Don't retry on system errors
             else:
-                # Bypass NLI check entirely
+                # Bypass Faithfulness Judge check entirely
                 is_refusal = False
-                nli_label = "NLI Check Disabled"
+                refusal_label = "Faithfulness Judge Check Disabled"
                 break  # Valid implicitly, exit retry loop
 
         answer_type = ANSWER_TYPE_REFUSAL if is_refusal else ANSWER_TYPE_DEFINITIVE
 
         if is_refusal:
-            citations = ""
-            if combined and policy_found:
-                # Near-Miss
-                citations = "\n\nSources: " + "; ".join(
-                    [
-                        f"{meta.get('doc_name', 'N/A')} §{meta.get('clause_number', 'N/A')} ({meta.get('section', 'N/A')}), p.{meta.get('page', 'N/A')}"
-                        for _, meta, _ in combined[:2]
-                    ]
+            if "model refusal" in refusal_label.lower():
+                # The LLM set can_answer=False and explained it.
+                cleaned_answer = (
+                    re.compile(re.escape(REFUSAL_STRING), re.IGNORECASE)
+                    .sub("", raw_answer)
+                    .strip()
                 )
-            final_answer = f"{REFUSAL_STRING}\nExplanation: The query's specifics could not be confidently verified against the policy document. (Reason: {nli_label}){citations}"
-            policy_found = False  # PRD test suite expects this for refusals to pass out-of-scope rules
+                if not cleaned_answer.startswith("Explanation:"):
+                    cleaned_answer = f"Explanation: {cleaned_answer}"
+                
+                final_answer = f"{REFUSAL_STRING}\n{cleaned_answer}"
+                
+                # Append sources if the LLM generated them
+                sources_val = getattr(pred, "sources", "").strip()
+                if (
+                    sources_val
+                    and sources_val.lower() != "none"
+                    and "Sources:" not in final_answer
+                ):
+                    final_answer = f"{final_answer}\n\nSources: {sources_val}"
+
+                if "Sources:" not in final_answer:
+                    final_answer = f"{final_answer}\n\nSources: None"
+            else:
+                final_answer = f"{REFUSAL_STRING}\nExplanation: The query's specifics could not be confidently verified against the policy document. (Reason: {refusal_label})\n\nSources: None"
+            policy_found = False
         else:
             final_answer = raw_answer
-            if hasattr(pred, "sources") and pred.sources:
-                final_answer = f"{final_answer}\n\nSources: {pred.sources}"
+            sources_val = getattr(pred, "sources", "").strip()
+            if (
+                sources_val
+                and sources_val.lower() != "none"
+                and "Sources:" not in final_answer
+            ):
+                final_answer = f"{final_answer}\n\nSources: {sources_val}"
+            elif "Sources:" not in final_answer:
+                final_answer = f"{final_answer}\n\nSources: None"
 
         final_prediction = dspy.Prediction(
             answer=final_answer,
@@ -515,7 +490,7 @@ class PolicyRAG(dspy.Module):
                 for r in combined[: self.top_k]
             ],
             max_relevance_score=float(max_score),
-            nli_label=nli_label,
+            refusal_label=refusal_label,
         )
 
         # Save to cache
@@ -537,7 +512,7 @@ def setup_dspy():
         temperature=0.0,  # Deterministic for grounded policy answers
         top_p=0.80,  # Qwen default; relaxed since temp=0 dominates
         top_k=20,  # Qwen default range; prevents repetition traps
-        max_tokens=512,  # Safe for 5GB VRAM, enough for policy answers
+        max_tokens=1024,  # Safe for 5GB VRAM, enough for policy answers
         frequency_penalty=0.1,  # Reduces repetition in small models
         # presence_penalty=0.0, # Unsupported by litellm's ollama_chat
     )
