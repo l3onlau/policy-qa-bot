@@ -36,23 +36,22 @@ logger = get_logger()
 
 class FaithfulnessJudge(dspy.Signature):
     """
-    You are an independent, highly critical insurance compliance auditor checking another agent's work.
-    Your task is to verify if the claim is STRICTLY supported by the context.
-    To mitigate self-evaluation bias, assume the claim is incorrect until proven otherwise.
-    
-    RULES:
-    1. Read the context carefully.
-    2. Read the claim.
-    3. Check if every part of the claim is directly supported by the context (synonyms like 'we will pay' for 'covered' are allowed).
-    4. If ANY part of the claim brings in outside information, introduces unsupported conditions, or contradicts the context, return 0.0.
-    5. If the claim is fully supported by the text, return 1.0.
+    You are an insurance compliance auditor. Verify if the 'claim' is grounded.
+
+    SPECIAL HANDLING:
+    1. REFUSAL VALIDATION: If the claim starts with 'I cannot find a definitive answer...', it is FAITHFUL if the context truly does not contain a specific answer or is ambiguous.
+    2. CITATION CHECK: Ensure the assistant's 'Sources' actually appear in the context headers/metadata.
+    3. NO HALLUCINATION: If the claim adds terms not in the context, it is UNFAITHFUL (is_faithful=False).
     """
 
-    context = dspy.InputField(desc="The official policy wording.")
-    claim = dspy.InputField(desc="Claim made by the assistant.")
+    context: str = dspy.InputField(
+        desc="Policy wording segments including metadata (doc_name, section, page)."
+    )
+    claim: str = dspy.InputField(desc="The assistant's response and citations.")
 
-    # By using CoT, we force the model to reason through the synonyms first
-    is_faithful: bool = dspy.OutputField(desc="Output True if strictly supported, False otherwise.")
+    is_faithful: bool = dspy.OutputField(
+        desc="True if the claim is a direct factual derivation or a valid PRD-mandated refusal. False if it fabricates terms or cites non-existent sections."
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -75,8 +74,8 @@ class QueryReformulator(dspy.Signature):
     4. Keep each query under 15 words.
     """
 
-    question = dspy.InputField(desc="The user's insurance question.")
-    search_queries = dspy.OutputField(
+    question: str = dspy.InputField(desc="The user's insurance question.")
+    search_queries: str = dspy.OutputField(
         desc="Exactly 3 alternative search queries, one per line."
     )
 
@@ -92,21 +91,29 @@ class PolicySignature(dspy.Signature):
     """
     You are a strict insurance compliance assistant. Answer questions using ONLY the provided context.
 
-    CITATION VERIFICATION: Accurately populate the `sources` field with the pre-formatted citations.
+    CRITICAL INSTRUCTIONS:
+    1. OUT-OF-SCOPE: If the question is unrelated to insurance (e.g., recipes, games), set can_answer=False and sources="None".
+    2. EXCLUSION CHECK: You MUST check for 'Exclusions', 'Limitations', or 'General Conditions' that may override a coverage clause.
+    3. CITATIONS: Use the pre-formatted citations provided in the context blocks.
     """
 
-    context = dspy.InputField(
+    context: str = dspy.InputField(
         desc="Relevant policy document chunks with pre-formatted citations."
     )
-    question = dspy.InputField(desc="The user's specific insurance inquiry.")
+    question: str = dspy.InputField(desc="The user's specific insurance inquiry.")
+
     can_answer: bool = dspy.OutputField(
-        desc="True if the context provides a definitive answer (or states it is explicitly covered/excluded). False if the context is a poor match, conflicts, or doesn't explicitly cover the specifics."
+        desc="True only if context provides a definitive answer. False if out-of-scope, ambiguous, or if specific conditions/exclusions are mentioned but the full impact is unclear."
     )
-    reasoning_and_answer = dspy.OutputField(
-        desc="If can_answer is True, provide a rigorous factual answer based exclusively on the context. If False, explain briefly why the context doesn't contain the answer and list closest related clauses."
+
+    reasoning_and_answer: str = dspy.OutputField(
+        desc="""If can_answer is True, provide a rigorous answer. 
+        If can_answer is False, you MUST start with: 'I cannot find a definitive answer in the provided policy wording.' 
+        Then, briefly explain the ambiguity or out-of-scope nature and list the closest related clauses if applicable."""
     )
-    sources = dspy.OutputField(
-        desc="The pre-formatted citations provided in the context, or 'None'."
+
+    sources: str = dspy.OutputField(
+        desc="The pre-formatted citations (e.g., 'Doc.pdf §Section, p.X') from the context, or 'None' if out-of-scope."
     )
 
 
@@ -135,14 +142,15 @@ class PolicyRAG(dspy.Module):
                 "device_map": "auto",
                 "quantization_config": BitsAndBytesConfig(
                     load_in_8bit=True,
+                    llm_int8_enable_fp32_cpu_offload=True,
                 ),
             },
-            max_length=4096,
+            max_length=1024,
         )
 
         self.faithfulness_judge = dspy.ChainOfThought(FaithfulnessJudge)
 
-        self.top_k = settings.top_k_rerank
+        self.top_k_rerank = settings.top_k_rerank
         self.relevance_threshold = 0.3
 
         # Simple exact-match semantic cache
@@ -178,7 +186,7 @@ class PolicyRAG(dspy.Module):
         # ── Fast-Path Intent Routing & Caching ────────────────────────────
         if settings.use_intent_routing and not self._is_valid_query(question):
             return dspy.Prediction(
-                answer=f"{REFUSAL_STRING} Explanation: The prompt does not appear to be an insurance question.",
+                answer=f"{REFUSAL_STRING}\nExplanation: The prompt does not appear to be an insurance question.\n\nSources: None",
                 policy_found=False,
                 answer_type=ANSWER_TYPE_REFUSAL,
                 retrieved_chunks=[],
@@ -205,8 +213,6 @@ class PolicyRAG(dspy.Module):
                 logger.debug(
                     f"Chain 1 | Reformulator generated queries: {json.dumps(alt_queries)}"
                 )
-                if logger.getEffectiveLevel() <= logging.DEBUG:
-                    print(f"DEBUG: Alternative queries: {alt_queries}")
             except Exception as e:
                 logger.debug(f"Chain 1 | Reformulator error: {e}")
 
@@ -218,7 +224,7 @@ class PolicyRAG(dspy.Module):
         # Concurrent retrieval to hide I/O latency
         def _fetch_docs(q):
             try:
-                return self.vectorstore.query(q, n_results=20)
+                return self.vectorstore.query(q, top_k_retrieve=settings.top_k_retrieve)
             except Exception as e:
                 logger.error(f"Retrieval error for query '{q}': {e}")
                 return {"documents": [], "metadatas": []}
@@ -243,7 +249,7 @@ class PolicyRAG(dspy.Module):
         if not merged_docs:
             logger.debug("Retrieval | No documents found.")
             return dspy.Prediction(
-                answer=f"{REFUSAL_STRING} No relevant documents were found.",
+                answer=f"{REFUSAL_STRING}\nExplanation: No relevant documents were found in the vector space.\n\nSources: None",
                 policy_found=False,
                 answer_type=ANSWER_TYPE_REFUSAL,
                 retrieved_chunks=[],
@@ -254,7 +260,7 @@ class PolicyRAG(dspy.Module):
 
         # Throttle batch size to avoid quadratic attention memory spikes
         # (similar to the fix in chunk embedding)
-        # Using batch_size=1 explicitly to avoid OOM on 5GB VRAM GPUs
+        # Using batch_size=1 explicitly to avoid OOM on 6GB VRAM GPUs
         scores = self.reranker.predict(pairs, batch_size=1, show_progress_bar=False)
 
         combined = sorted(
@@ -263,7 +269,7 @@ class PolicyRAG(dspy.Module):
             reverse=True,
         )
 
-        for i, (cd, cm, cs) in enumerate(combined[: self.top_k]):
+        for i, (cd, cm, cs) in enumerate(combined[: self.top_k_rerank]):
             logger.debug(
                 f"Chain 2 | Reranked #{i + 1} score={cs:.3f}, doc={cm.get('doc_name')}"
             )
@@ -279,7 +285,7 @@ class PolicyRAG(dspy.Module):
         sentence_metadata = []
 
         if settings.use_chunk_distillation:
-            for doc_text, meta, _ in combined[: self.top_k]:
+            for doc_text, meta, _ in combined[: self.top_k_rerank]:
                 if meta.get("is_table"):
                     # Bypass sentence splitting for tables, keep intact
                     distilled_pairs.append([question, doc_text])
@@ -324,7 +330,7 @@ class PolicyRAG(dspy.Module):
             )
         else:
             # Bypass distillation
-            distilled_combined = combined[: self.top_k]
+            distilled_combined = combined[: self.top_k_rerank]
 
         # Deduplicate distilled segments
         seen_distilled = set()
@@ -341,7 +347,7 @@ class PolicyRAG(dspy.Module):
             if not settings.use_chunk_distillation:
                 final_distilled = [
                     x
-                    for x in combined[: self.top_k]
+                    for x in combined[: self.top_k_rerank]
                     if x[2] >= self.relevance_threshold
                 ]
 
@@ -382,7 +388,7 @@ class PolicyRAG(dspy.Module):
         for attempt in range(max_retries + 1):
             if attempt > 0:
                 print(
-                    f"⚠️ LLM Check Failed (Faithfulness too low). Retrying generation (Attempt {attempt})..."
+                    f"⚠️ LLM Check Failed (Faithfulness fail). Retrying generation (Attempt {attempt})..."
                 )
                 # Fallback Routing: prompt with explicit feedback
                 retry_question = f"{question}\n\nWARNING: Your previous answer contained unverified facts. You MUST stick strictly to the context."
@@ -392,13 +398,17 @@ class PolicyRAG(dspy.Module):
                 pred = self.generator(context=full_context, question=question)
 
             raw_answer = pred.reasoning_and_answer
-            logger.debug(f"Chain 3 | Generator Output:\n{raw_answer}")
+            raw_sources = getattr(pred, "sources", "None")
 
-            # Fast-path: check boolean flag for refusal
-            can_answer = getattr(pred, 'can_answer', True)
+            # CRITICAL FIX: Concatenate answer and sources for the judge
+            full_claim_for_judge = f"{raw_answer}\n\nSources: {raw_sources}"
+
+            logger.debug(f"Chain 3 | Generator Output:\n{full_claim_for_judge}")
+
+            can_answer = getattr(pred, "can_answer", True)
             if isinstance(can_answer, str):
                 can_answer = can_answer.strip().lower() == "true"
-                
+
             if not can_answer or REFUSAL_STRING.lower() in raw_answer.lower():
                 is_refusal = True
                 refusal_label = "Model Refusal"
@@ -407,18 +417,23 @@ class PolicyRAG(dspy.Module):
             # ── Chain 4: LLM as a judge Verification ──────────────────────────
             if settings.use_faithfulness_judge_check:
                 try:
+                    # Pass the concatenated claim
                     pred_judge = self.faithfulness_judge(
-                        context=full_context, claim=raw_answer
+                        context=full_context, claim=full_claim_for_judge
                     )
 
                     # Simple boolean check from the 4B model
-                    is_faithful_verdict = getattr(pred_judge, 'is_faithful', False)
-                    
+                    is_faithful_verdict = getattr(pred_judge, "is_faithful", False)
+
                     # Ensure it's a bool (in case dspy/model returns a truthy string)
                     if isinstance(is_faithful_verdict, str):
-                        is_faithful_verdict = is_faithful_verdict.strip().lower() == "true"
+                        is_faithful_verdict = (
+                            is_faithful_verdict.strip().lower() == "true"
+                        )
 
-                    logger.debug(f"Chain 4 | Judge Verdict (is_faithful): {is_faithful_verdict}")
+                    logger.debug(
+                        f"Chain 4 | Judge Verdict (is_faithful): {is_faithful_verdict}"
+                    )
 
                     if is_faithful_verdict:
                         # Success (Faithful)
@@ -427,9 +442,10 @@ class PolicyRAG(dspy.Module):
                     else:
                         # Failure
                         logger.debug(
-                            f"Chain 4 | Rejected by Judge: claim not strictly supported."
+                            "Chain 4 | Rejected by Judge: claim not strictly supported."
                         )
                         is_refusal = True  # Fail, will retry if attempts left
+                        refusal_label = "Judge Failure"
 
                 except Exception as e:
                     logger.error(f"Chain 4 | Error inside FaithfulnessJudge: {e}")
@@ -443,31 +459,33 @@ class PolicyRAG(dspy.Module):
         answer_type = ANSWER_TYPE_REFUSAL if is_refusal else ANSWER_TYPE_DEFINITIVE
 
         if is_refusal:
+            cleaned_answer = (
+                re.compile(re.escape(REFUSAL_STRING), re.IGNORECASE)
+                .sub("", raw_answer)
+                .strip()
+            )
+
             if "model refusal" in refusal_label.lower():
                 # The LLM set can_answer=False and explained it.
-                cleaned_answer = (
-                    re.compile(re.escape(REFUSAL_STRING), re.IGNORECASE)
-                    .sub("", raw_answer)
-                    .strip()
-                )
                 if not cleaned_answer.startswith("Explanation:"):
                     cleaned_answer = f"Explanation: {cleaned_answer}"
-                
                 final_answer = f"{REFUSAL_STRING}\n{cleaned_answer}"
-                
-                # Append sources if the LLM generated them
-                sources_val = getattr(pred, "sources", "").strip()
-                if (
-                    sources_val
-                    and sources_val.lower() != "none"
-                    and "Sources:" not in final_answer
-                ):
-                    final_answer = f"{final_answer}\n\nSources: {sources_val}"
-
-                if "Sources:" not in final_answer:
-                    final_answer = f"{final_answer}\n\nSources: None"
             else:
-                final_answer = f"{REFUSAL_STRING}\nExplanation: The query's specifics could not be confidently verified against the policy document. (Reason: {refusal_label})\n\nSources: None"
+                # Judge Failure or other refusal: preserve the generated explanation and closest clauses
+                final_answer = f"{REFUSAL_STRING}\nExplanation: The query's specifics could not be confidently verified against the policy document. (Reason: {refusal_label})\nContext Analysis: {cleaned_answer}"
+
+            # CRITICAL FIX: Extract and append sources universally for all refusals
+            sources_val = getattr(pred, "sources", "").strip()
+            if (
+                sources_val
+                and sources_val.lower() != "none"
+                and "Sources:" not in final_answer
+            ):
+                final_answer = f"{final_answer}\n\nSources: {sources_val}"
+
+            if "Sources:" not in final_answer:
+                final_answer = f"{final_answer}\n\nSources: None"
+
             policy_found = False
         else:
             final_answer = raw_answer
@@ -487,7 +505,7 @@ class PolicyRAG(dspy.Module):
             answer_type=answer_type,
             retrieved_chunks=[
                 {"text": r[0], "metadata": r[1], "score": float(r[2])}
-                for r in combined[: self.top_k]
+                for r in combined[: self.top_k_rerank]
             ],
             max_relevance_score=float(max_score),
             refusal_label=refusal_label,
@@ -512,7 +530,7 @@ def setup_dspy():
         temperature=0.0,  # Deterministic for grounded policy answers
         top_p=0.80,  # Qwen default; relaxed since temp=0 dominates
         top_k=20,  # Qwen default range; prevents repetition traps
-        max_tokens=1024,  # Safe for 5GB VRAM, enough for policy answers
+        max_tokens=1024,  # Safe for 6GB VRAM, enough for policy answers
         frequency_penalty=0.1,  # Reduces repetition in small models
         # presence_penalty=0.0, # Unsupported by litellm's ollama_chat
     )

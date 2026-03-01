@@ -3,7 +3,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 class Settings(BaseSettings):
     # LLM (via Ollama)
-    dspy_lm_model: str = "ollama_chat/qwen3:4b-instruct-2507-q4_K_M"
+    dspy_lm_model: str = "ollama_chat/qwen3:4b-instruct"
     dspy_api_base: str = "http://localhost:11434"
     hf_tokenizer: str = "Qwen/Qwen3-4B-Instruct-2507"  # HF name
 
@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     data_dir: str = "./data"
 
     # Retrieval Tuning
-    top_k_rerank: int = 10
+    top_k_retrieve: int = 100
+    top_k_rerank: int = 5
 
     # AI Engineering Flags - Toggle pipeline components
     use_semantic_cache: bool = True
@@ -28,7 +29,7 @@ class Settings(BaseSettings):
 
     # Enable optimized few-shot prompt from optimize_rag.py
     # WARNING: Turning this on drastically increases Ollama's context window.
-    # If running locally on a 5GB VRAM limit alongside the Embedder and Reranker,
+    # If running locally on a 6GB VRAM limit alongside the Embedder and Reranker,
     # this is prone to cause CUDA Out Of Memory (OOM) crashes.
     use_compiled_prompt: bool = False
 

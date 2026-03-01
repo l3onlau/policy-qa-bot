@@ -9,7 +9,7 @@ from docling_core.types.doc import DocItemLabel
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from transformers import AutoTokenizer
 from config import settings
-
+import multiprocessing as mp
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Labels that contain meaningful text content — all should be ingested.
@@ -44,19 +44,12 @@ class PolicyIngestor:
     """
 
     def __init__(self):
-        pipeline_options = PdfPipelineOptions()
-        pipeline_options.do_ocr = True
-        pipeline_options.do_table_structure = True
-
-        self.converter = DocumentConverter(
-            format_options={
-                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
-            }
-        )
-
+        # ─────────────────────────────────────────────────────────────────
+        # MODIFIED: Removed DocumentConverter initialization.
+        # Prevents the main process from acquiring a persistent CUDA context.
+        # ─────────────────────────────────────────────────────────────────
         self.tokenizer = AutoTokenizer.from_pretrained(settings.hf_tokenizer)
 
-        # Parent chunks: ~750 tokens — what the LLM sees (PRD: 400-800 tokens)
         self.parent_splitter = RecursiveCharacterTextSplitter(
             chunk_size=800,
             chunk_overlap=80,
@@ -64,7 +57,6 @@ class PolicyIngestor:
             separators=["\n## ", "\n### ", "\n\n", "\n", ". ", " "],
         )
 
-        # Child chunks: ~200 tokens — what FAISS indexes for precise search
         self.child_splitter = RecursiveCharacterTextSplitter(
             chunk_size=200,
             chunk_overlap=20,
@@ -108,13 +100,13 @@ class PolicyIngestor:
         display_path = f"{path_str} ({label_suffix})" if label_suffix else path_str
 
         is_table = label_suffix == "Table"
-        
+
         parent_chunks = self.parent_splitter.split_text(full_text)
 
         for parent_text in parent_chunks:
             parent_id = str(uuid.uuid4())
             parent_with_heading = f"## {display_path}\n\n{parent_text}"
-            
+
             child_chunks = self.child_splitter.split_text(parent_text)
 
             for child_text in child_chunks:
@@ -188,108 +180,93 @@ class PolicyIngestor:
     # Main processing pipeline
     # ─────────────────────────────────────────────────────────────────────
 
-    def process_pdfs(self, data_path: str) -> List[Dict[str, Any]]:
+    def _process_single_pdf_worker(
+        self, file_path: str, file: str
+    ) -> List[Dict[str, Any]]:
         """
-        Process all PDFs in data_path using a two-pass strategy.
-
-        Returns a list of child documents, each containing:
-        - 'content': child chunk text (small, for FAISS indexing)
-        - 'parent_content': parent chunk text (large, for LLM context)
-        - 'metadata': {doc_name, section, clause_number, page, heading_path, parent_id}
+        NEW: Isolated worker function.
+        Initializes Docling natively in the child process to map VRAM strictly to the ephemeral PID.
         """
-        all_documents: List[Dict[str, Any]] = []
+        pipeline_options = PdfPipelineOptions()
+        pipeline_options.do_ocr = True
+        pipeline_options.do_table_structure = True
 
-        for file in os.listdir(data_path):
-            if not file.endswith(".pdf"):
-                continue
+        converter = DocumentConverter(
+            format_options={
+                InputFormat.PDF: PdfFormatOption(pipeline_options=pipeline_options)
+            }
+        )
 
-            file_documents: List[Dict[str, Any]] = []
-            file_path = os.path.join(data_path, file)
-            print(f"🧐 Parsing document: {file}...")
+        print(f"🧐 Parsing document: {file}...")
 
-            result = self.converter.convert(file_path)
-            doc_data = result.document
+        result = converter.convert(file_path)
+        doc_data = result.document
 
-            # Explicitly unload the Docling backend to free GPU memory
-            if (
-                hasattr(result, "input")
-                and hasattr(result.input, "_backend")
-                and hasattr(result.input._backend, "unload")
-            ):
-                result.input._backend.unload()
+        file_documents: List[Dict[str, Any]] = []
+        heading_path: List[str] = ["General Policy"]
+        current_clause = ""
+        section_buffer: List[str] = []
+        last_page: Any = "??"
+        structured_page_chars: Dict[int, int] = {}
 
-            # ── Pass 1: Structured item-by-item extraction ────────────────
-            heading_path: List[str] = ["General Policy"]
-            current_clause = ""
-            section_buffer: List[str] = []
-            last_page: Any = "??"
+        def track_content(text: str, page: Any):
+            if isinstance(page, int) and text.strip():
+                structured_page_chars[page] = structured_page_chars.get(page, 0) + len(
+                    text.strip()
+                )
 
-            # Track which text was captured per page (for reconciliation)
-            structured_page_chars: Dict[int, int] = {}
+        def flush_section_buffer(
+            path: List[str], clause: str, buffer: List[str], page: Any
+        ):
+            if not buffer:
+                return
+            full_text = "\n".join(buffer)
+            track_content(full_text, page)
+            file_documents.extend(
+                self._make_chunks(full_text, path, clause, page, file)
+            )
+            buffer.clear()
 
-            def track_content(text: str, page: Any):
-                """Accumulate character count captured per page."""
-                if isinstance(page, int) and text.strip():
-                    structured_page_chars[page] = structured_page_chars.get(
-                        page, 0
-                    ) + len(text.strip())
+        # ── Pass 1: Structured item-by-item extraction ──
+        for item, depth in doc_data.iterate_items():
+            item_page = item.prov[0].page_no if item.prov else None
+            if item_page is not None:
+                last_page = item_page
 
-            def flush_section_buffer(
-                path: List[str], clause: str, buffer: List[str], page: Any
-            ):
-                if not buffer:
-                    return
-                full_text = "\n".join(buffer)
-                track_content(full_text, page)
-                chunks = self._make_chunks(full_text, path, clause, page, file)
-                file_documents.extend(chunks)
-                buffer.clear()
+            if item.label == DocItemLabel.SECTION_HEADER:
+                flush_section_buffer(
+                    heading_path, current_clause, section_buffer, last_page
+                )
+                heading_text = (
+                    item.text.strip()
+                    if hasattr(item, "text") and item.text
+                    else "General Policy"
+                )
+                if depth <= len(heading_path):
+                    heading_path = heading_path[: depth - 1]
+                heading_path.append(heading_text)
+                current_clause = self.extract_clause(heading_text) or current_clause
 
-            for item, depth in doc_data.iterate_items():
-                # ── Update page from every item (not just text) ───────────
-                item_page = item.prov[0].page_no if item.prov else None
-                if item_page is not None:
-                    last_page = item_page
+            elif item.label in TEXT_BEARING_LABELS:
+                content = item.text if hasattr(item, "text") else ""
+                if content:
+                    if item.label == DocItemLabel.LIST_ITEM:
+                        content = f"* {content}"
+                    elif item.label == DocItemLabel.FOOTNOTE:
+                        content = f"[Footnote] {content}"
+                    elif item.label == DocItemLabel.CAPTION:
+                        content = f"[Caption] {content}"
+                    section_buffer.append(content)
 
-                # ── SECTION_HEADER: update heading path ───────────────────
-                if item.label == DocItemLabel.SECTION_HEADER:
-                    flush_section_buffer(
-                        heading_path, current_clause, section_buffer, last_page
-                    )
-                    heading_text = (
-                        item.text.strip()
-                        if hasattr(item, "text") and item.text
-                        else "General Policy"
-                    )
-
-                    if depth <= len(heading_path):
-                        heading_path = heading_path[: depth - 1]
-                    heading_path.append(heading_text)
-
-                    current_clause = self.extract_clause(heading_text) or current_clause
-
-                # ── Text-bearing labels: buffer for section chunking ──────
-                elif item.label in TEXT_BEARING_LABELS:
-                    content = item.text if hasattr(item, "text") else ""
-                    if content:
-                        if item.label == DocItemLabel.LIST_ITEM:
-                            content = f"* {content}"
-                        elif item.label == DocItemLabel.FOOTNOTE:
-                            content = f"[Footnote] {content}"
-                        elif item.label == DocItemLabel.CAPTION:
-                            content = f"[Caption] {content}"
-                        section_buffer.append(content)
-
-                # ── TABLE: flush buffer, then process table separately ────
-                elif item.label == DocItemLabel.TABLE:
-                    flush_section_buffer(
-                        heading_path, current_clause, section_buffer, last_page
-                    )
-                    if hasattr(item, "export_to_markdown"):
-                        table_md = item.export_to_markdown(doc=doc_data)
-                        track_content(table_md, last_page)
-
-                        chunks = self._make_chunks(
+            elif item.label == DocItemLabel.TABLE:
+                flush_section_buffer(
+                    heading_path, current_clause, section_buffer, last_page
+                )
+                if hasattr(item, "export_to_markdown"):
+                    table_md = item.export_to_markdown(doc=doc_data)
+                    track_content(table_md, last_page)
+                    file_documents.extend(
+                        self._make_chunks(
                             table_md,
                             heading_path,
                             current_clause,
@@ -297,54 +274,69 @@ class PolicyIngestor:
                             file,
                             label_suffix="Table",
                         )
-                        file_documents.extend(chunks)
-
-                # ── PICTURE: extract any OCR text it may carry ────────────
-                elif item.label == DocItemLabel.PICTURE:
-                    content = item.text if hasattr(item, "text") and item.text else ""
-                    # Only ingest if there's meaningful text (>20 chars)
-                    if content and len(content.strip()) > 20:
-                        track_content(content, last_page)
-                        section_buffer.append(content)
-
-            # Flush any remaining buffered text
-            flush_section_buffer(
-                heading_path, current_clause, section_buffer, last_page
-            )
-
-            # ── Pass 2: Page-level reconciliation ─────────────────────────
-            # Detect pages where structured extraction captured < 40% of
-            # the available text and create supplementary chunks from all
-            # text on those pages.  This catches content in exotic label
-            # types or layout edge-cases that the structured pass missed.
-            all_page_text = self._collect_all_page_text(doc_data)
-            page_heading_map = self._build_page_heading_map(doc_data)
-
-            supplementary_count = 0
-            for page_no in sorted(all_page_text.keys()):
-                total_page_len = sum(len(t) for t in all_page_text[page_no])
-                structured_len = structured_page_chars.get(page_no, 0)
-                coverage = structured_len / max(total_page_len, 1)
-
-                if coverage < 0.4 and total_page_len > 50:
-                    page_heading = page_heading_map.get(page_no, ["General Policy"])
-                    combined_text = "\n".join(all_page_text[page_no])
-
-                    chunks = self._make_chunks(
-                        combined_text,
-                        page_heading,
-                        "",
-                        page_no,
-                        file,
-                        label_suffix="Supplementary",
                     )
-                    file_documents.extend(chunks)
-                    supplementary_count += len(chunks)
 
-            print(
-                f"   ✅ Processed {file}: {len(file_documents)} chunks generated"
-                f" ({supplementary_count} supplementary)."
-            )
-            all_documents.extend(file_documents)
+            elif item.label == DocItemLabel.PICTURE:
+                content = item.text if hasattr(item, "text") and item.text else ""
+                if content and len(content.strip()) > 20:
+                    track_content(content, last_page)
+                    section_buffer.append(content)
+
+        flush_section_buffer(heading_path, current_clause, section_buffer, last_page)
+
+        # ── Pass 2: Page-level reconciliation ──
+        all_page_text = self._collect_all_page_text(doc_data)
+        page_heading_map = self._build_page_heading_map(doc_data)
+
+        supplementary_count = 0
+
+        for page_no in sorted(all_page_text.keys()):
+            total_page_len = sum(len(t) for t in all_page_text[page_no])
+            structured_len = structured_page_chars.get(page_no, 0)
+            coverage = structured_len / max(total_page_len, 1)
+
+            if coverage < 0.4 and total_page_len > 50:
+                page_heading = page_heading_map.get(page_no, ["General Policy"])
+                combined_text = "\n".join(all_page_text[page_no])
+                chunks = self._make_chunks(
+                    combined_text,
+                    page_heading,
+                    "",
+                    page_no,
+                    file,
+                    label_suffix="Supplementary",
+                )
+
+                file_documents.extend(chunks)
+                supplementary_count += len(chunks)
+            # Multiprocessing doesn't show, not important
+        print(
+            f"   ✅ Processed {file}: {len(file_documents)} chunks generated"
+            f" ({supplementary_count} supplementary)."
+        )
+
+        return file_documents
+
+    def process_pdfs(self, data_path: str) -> List[Dict[str, Any]]:
+        """
+        MODIFIED: Replaced inline processing with constrained Multiprocessing Pool.
+        """
+        all_documents: List[Dict[str, Any]] = []
+        files_to_process = [
+            (os.path.join(data_path, f), f)
+            for f in os.listdir(data_path)
+            if f.endswith(".pdf")
+        ]
+
+        # Use 'spawn' to prevent CUDA initialization inheritance
+        ctx = mp.get_context("spawn")
+
+        # maxtasksperchild=1 is critical: forces worker process to die (releasing 100% VRAM)
+        # before spinning up a new worker for the next file.
+        with ctx.Pool(processes=1, maxtasksperchild=1) as pool:
+            results = pool.starmap(self._process_single_pdf_worker, files_to_process)
+
+        for chunks in results:
+            all_documents.extend(chunks)
 
         return all_documents

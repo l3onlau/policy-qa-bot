@@ -7,6 +7,7 @@ import faiss
 import numpy as np
 from rank_bm25 import BM25Okapi
 from sentence_transformers import SentenceTransformer
+from transformers import BitsAndBytesConfig
 
 from config import settings
 
@@ -41,18 +42,18 @@ class PolicyVectorStore:
 
         self.embedder = SentenceTransformer(
             self.model_name,
-            device="cpu",
-            # model_kwargs={
-            #     "device_map": "auto",
-            #     "quantization_config": BitsAndBytesConfig(
-            #         load_in_8bit=True,
-            #         llm_int8_enable_fp32_cpu_offload=True,
-            #     ),
-            # },
+            # device="cpu",
+            model_kwargs={
+                "device_map": "auto",
+                "quantization_config": BitsAndBytesConfig(
+                    load_in_8bit=True,
+                    llm_int8_enable_fp32_cpu_offload=True,
+                ),
+            },
         )
         # Upgrade reasonable context limit
         if hasattr(self.embedder, "max_seq_length"):
-            self.embedder.max_seq_length = 4096
+            self.embedder.max_seq_length = 1024
 
         self.documents: List[str] = []
         self.parent_documents: List[str] = []
@@ -92,7 +93,7 @@ class PolicyVectorStore:
             batch_texts = texts[i : i + batch_size]
             print(f"   ⏳ Embedding batch {i // batch_size + 1} of {total_batches}...")
             # Enforce tiny iteration batch_size (2-4 max) to prevent quadratic
-            # attention memory spikes from 4096 max_length on only 5GB of VRAM
+            # attention memory spikes from 4096 max_length on only 6GB of VRAM
             batch_emb = self.embedder.encode(
                 batch_texts, batch_size=2, show_progress_bar=False
             )
@@ -123,7 +124,7 @@ class PolicyVectorStore:
     def query(
         self,
         query_text: str,
-        n_results: int = 5,
+        top_k_retrieve: int = 100,
         filters: Optional[Dict[str, str]] = None,
     ) -> Dict[str, Any]:
         """
@@ -152,7 +153,7 @@ class PolicyVectorStore:
         query_embedding = self.embedder.encode([query_text]).astype("float32")
         faiss.normalize_L2(query_embedding)
 
-        search_k = n_results * 8 if filters else n_results * 4
+        search_k = top_k_retrieve * 8 if filters else top_k_retrieve * 4
         faiss_distances, faiss_indices = self.index.search(query_embedding, search_k)
         faiss_results = [i for i in faiss_indices[0] if i != -1]
 
@@ -161,7 +162,7 @@ class PolicyVectorStore:
 
         # 2. Keyword search (exact term matching on both child AND parent chunks)
         tokenized_query = tokenize_text(query_text)
-        bm25_pool_size = n_results * 5
+        bm25_pool_size = top_k_retrieve * 5
 
         bm25_results = []
         if self.bm25:
@@ -199,13 +200,13 @@ class PolicyVectorStore:
             # weight because parent text is broader and less precise)
             fused_scores[idx] = fused_scores.get(idx, 0) + 2.0 / (k + rank + 1)
 
-        # Sort by fused score, then deduplicate BEFORE truncating to n_results
+        # Sort by fused score, then deduplicate BEFORE truncating to top_k_retrieve
         # (previously dedup happened after, which could lose good candidates)
         reranked_indices = sorted(
             fused_scores.keys(), key=lambda x: fused_scores[x], reverse=True
         )
 
-        # Deduplicate by parent_id THEN limit to n_results
+        # Deduplicate by parent_id THEN limit to top_k_retrieve
         seen_parents = set()
         deduped_indices = []
         for idx in reranked_indices:
@@ -213,7 +214,7 @@ class PolicyVectorStore:
             if parent_id not in seen_parents:
                 seen_parents.add(parent_id)
                 deduped_indices.append(idx)
-            if len(deduped_indices) >= n_results:
+            if len(deduped_indices) >= top_k_retrieve:
                 break
 
         return {

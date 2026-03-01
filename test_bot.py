@@ -1,4 +1,5 @@
 import json
+from typing import Literal
 import dspy
 from src.engine import PolicyRAG, setup_dspy
 from src.vectorstore import PolicyVectorStore
@@ -8,28 +9,24 @@ from dotenv import load_dotenv
 
 class AnswerCorrectness(dspy.Signature):
     """
-    You are a strict, objective grader evaluating whether an AI's 'generated_answer' matches the factual meaning and conclusion of the 'expected_answer'.
+    You are a strict, objective grader evaluating an AI's 'generated_answer' against an 'expected_answer'.
 
-    CRITICAL RULES (STRICTLY ENFORCED BY YOU):
-    1. CONTRADICTION = FAIL: If the 'expected_answer' explicitly defines something, provides a rule, or claims coverage, and the 'generated_answer' claims it is not defined, not covered, or unknown, you MUST output FAIL.
-    2. YES/NO MISMATCH = FAIL: If the 'expected_answer' starts with or says 'Yes' or 'Covered', but the 'generated_answer' says 'No' or 'Excluded' (or vice versa), output FAIL.
-    3. FABRICATION = FAIL: If the 'generated_answer' confidently states coverage, exclusions, or rules that directly conflict with the core facts in 'expected_answer', output FAIL.
-    4. NO DEFINITIVE ANSWER MISMATCH = FAIL: If the 'expected_answer' states 'I cannot find a definitive answer', but the 'generated_answer' gives a definitive 'Yes' or 'No', output FAIL.
-    5. PASS CONDITION: Output PASS ONLY IF the 'generated_answer' fundamentally agrees with the core facts and main conclusion of the 'expected_answer' without any contradiction.
+    CRITICAL RULES:
+    1. CONTRADICTION = FAIL: If generated_answer says 'unknown' when expected_answer has a fact (or vice versa).
+    2. YES/NO MISMATCH = FAIL: Any flip in coverage status is an automatic FAIL.
+    3. CITATION HYGIENE = FAIL: If the generated_answer includes citations for a question it admitted it couldn't answer (Out-of-Scope), or if citations are missing when they should be present.
+    4. VERBATIM REFUSAL: The generated_answer MUST include the specific PRD refusal string if it cannot answer.
     """
 
-    question = dspy.InputField()
-    expected_answer = dspy.InputField(
-        desc="The absolute factual truth. The generated answer MUST match its core logic, facts, and conclusions."
+    question: str = dspy.InputField()
+    expected_answer: str = dspy.InputField(desc="The ground truth logic and citations.")
+    generated_answer: str = dspy.InputField(desc="The AI output to evaluate.")
+
+    verdict: Literal["PASS", "FAIL"] = dspy.OutputField(
+        desc="EXACTLY 'PASS' or 'FAIL'."
     )
-    generated_answer = dspy.InputField(
-        desc="The AI's answer to evaluate."
-    )
-    verdict = dspy.OutputField(
-        desc="Output EXACTLY 'PASS' if the generated answer fully agrees with the expected answer. Output 'FAIL' if there is ANY contradiction, missing main definition, or yes/no mismatch."
-    )
-    reason = dspy.OutputField(
-        desc="One clear, concise sentence explaining why the answer PASSED or FAILED based strictly on comparing the facts in generated vs expected answers."
+    reason: str = dspy.OutputField(
+        desc="Concise explanation focusing on contradictions or citation errors."
     )
 
 

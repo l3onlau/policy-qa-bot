@@ -95,10 +95,10 @@ All models and paths are configured via `config.py`:
 DSPY_LM_MODEL=ollama_chat/qwen3:4b-instruct-2507-q4_K_M
 DSPY_API_BASE=http://localhost:11434
 EMBED_MODEL=Qwen/Qwen3-Embedding-0.6B
-RERANKER_MODEL=tomaarsen/Qwen3-Reranker-0.6B-seq-cls
+RERANKER_MODEL=Alibaba-NLP/gte-reranker-modernbert-base
 FAISS_INDEX_PATH=./faiss_db/policy_index.faiss
 DATA_DIR=./data
-TOP_K_RERANK=10
+TOP_K_RERANK=20
 
 # AI Engineering Flags
 USE_SEMANTIC_CACHE=True
@@ -142,4 +142,4 @@ This architecture is strictly optimized for local consumer hardware (e.g., 6GB V
 * **Reranker as a "Hard Gate":** Small models struggle to execute clean refusals and often try to force out-of-scope concepts into their answers. The Cross-Encoder reranker functions as a mandatory mathematical gate to counteract this. By calculating exact relevance probabilities and aggressively dropping chunks, it physically starves the LLM of irrelevant context to force deterministic "Out-of-Scope" refusals.
 
 > [!WARNING]
-> **Automatic Memory Management:** To ensure stable execution even on constrained hardware (e.g. 5GB VRAM limits), the system strictly utilizes 8-bit dynamic quantization + CPU offloading for the majority of the Transformer pipelines where supported. Furthermore, heavy processing contexts (4096 tokens) are batched down to micro-batches (batch_size=1) to prevent quadratic attention OOM spikes natively during inference.
+> **Automatic Memory Management:** To ensure stable execution even on constrained hardware (e.g. 6GB VRAM limits), the system strictly utilizes 4-bit llm + 8-bit dynamic quantization for the majority of the Transformer pipelines where supported. Furthermore, heavy processing contexts (1024 tokens) are batched down to micro-batches (batch_size=1) to prevent quadratic attention OOM spikes natively during inference.
